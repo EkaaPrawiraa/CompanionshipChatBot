@@ -1,0 +1,16 @@
+services:
+  neo4j:
+    image: neo4j:5.26-community
+    ports:
+      - "7474:7474"   # Browser UI
+      - "7687:7687"   # Bolt protocol
+    environment:
+      NEO4J_AUTH: neo4j/yourpassword
+      NEO4J_PLUGINS: '["apoc"]'
+      NEO4J_dbms_security_procedures_unrestricted: "apoc.*"
+    volumes:
+      - neo4j_data:/data
+      - ./infra/neo4j/schema:/schema   # mounts your .cypher files
+      - ./infra/neo4j/migrations:/migrations
+volumes:
+  neo4j_data:
