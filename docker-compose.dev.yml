@@ -12,5 +12,29 @@ services:
       - neo4j_data:/data
       - ./infra/neo4j/schema:/schema   # mounts your .cypher files
       - ./infra/neo4j/migrations:/migrations
+
+  postgres:
+    image: pgvector/pgvector:pg15
+    environment:
+      POSTGRES_USER: companion
+      POSTGRES_PASSWORD: devpassword
+      POSTGRES_DB: companion_chatbot
+    ports:
+      - "5433:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./infra/postgres/init.sql:/docker-entrypoint-initdb.d/000_init.sql
+      - ./infra/postgres/pgvector_init.sql:/docker-entrypoint-initdb.d/010_pgvector_init.sql
+      - ./backups:/backups
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U companion -d companion_chatbot"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+
 volumes:
   neo4j_data:
+  postgres_data:
+
+  

@@ -1,22 +1,28 @@
 // =============================================================================
 // indexes.cypher
 //
-// Performance, fulltext, and vector indexes for all node types.
+// Performance and fulltext indexes for all node types.
 // Run AFTER constraints.cypher.
 //
 // Execution order:
 //   1. constraints.cypher
-//   2. indexes.cypher      ← this file
+//   2. indexes.cypher      <- this file
 //   3. seed.cypher         (dev only)
 //
 // Index categories used in this file:
 //   [LOOKUP]    -- standard b-tree / range index on single property
 //   [COMPOSITE] -- multi-property index for compound filter queries
-//   [FULLTEXT]  -- tokenized text search (APOC / Cypher fulltext)
-//   [VECTOR]    -- ANN vector index for pgvector-style cosine search
-//                  (requires Neo4j 5.11+ with vector index support)
+//   [FULLTEXT]  -- tokenized text search (Cypher fulltext)
 //
 // All indexes use IF NOT EXISTS for idempotency.
+//
+// DevNotes v1.3, Section 1.4: vector indexes were removed from this
+// file. Neo4j Community Edition does not expose
+// db.index.vector.queryNodes, so all cosine similarity work has moved
+// to the pgvector mirror tables (memory_embeddings,
+// experience_embeddings, thought_embeddings, trigger_embeddings).
+// What remains here is a btree index on embedding_synced so the retry
+// job can sweep nodes whose pgvector row has not yet been written.
 // =============================================================================
 
 
@@ -83,19 +89,13 @@ CREATE INDEX experience_source_session_idx IF NOT EXISTS
   FOR (e:Experience)
   ON (e.source_session_id);
 
-// [VECTOR] Semantic similarity search on Experience descriptions.
-// Top-5 cosine retrieval (hybrid retrieval signal 2).
-// Dimension 1536 matches text-embedding-3-small output size.
-// Change to 3072 if using text-embedding-3-large.
-CREATE VECTOR INDEX experience_embedding_idx IF NOT EXISTS
+// [LOOKUP] embedding_synced sweep for the cross-store retry job
+// (DevNotes v1.3, Section 1.4). Drives:
+//   MATCH (e:Experience) WHERE e.active = true AND e.embedding_synced = false
+//   RETURN e LIMIT $batch_size
+CREATE INDEX experience_embedding_synced_idx IF NOT EXISTS
   FOR (e:Experience)
-  ON (e.embedding)
-  OPTIONS {
-    indexConfig: {
-      `vector.dimensions`:   1536,
-      `vector.similarity_function`: 'cosine'
-    }
-  };
+  ON (e.embedding_synced);
 
 // [FULLTEXT] Free-text description search for entity resolution and
 // deduplication review (0.65-0.85 similarity range triggers LLM merge prompt).
@@ -168,6 +168,13 @@ CREATE INDEX trigger_active_category_freq_idx IF NOT EXISTS
   FOR (t:Trigger)
   ON (t.active, t.category, t.frequency);
 
+// [LOOKUP] embedding_synced sweep for the cross-store retry job
+// (DevNotes v1.3, Section 1.4). Trigger gained an embedding column for
+// cross-phrasing entity dedup in pgvector.
+CREATE INDEX trigger_embedding_synced_idx IF NOT EXISTS
+  FOR (t:Trigger)
+  ON (t.embedding_synced);
+
 // [FULLTEXT] Entity resolution on trigger descriptions --
 // same deduplication pipeline as Experience (cosine + fulltext).
 CREATE FULLTEXT INDEX trigger_description_ft_idx IF NOT EXISTS
@@ -196,17 +203,11 @@ CREATE INDEX thought_timestamp_idx IF NOT EXISTS
   FOR (th:Thought)
   ON (th.timestamp);
 
-// [VECTOR] Semantic similarity on Thought content.
-// Used in deduplication (threshold 0.85 = merge, 0.65 = LLM review).
-CREATE VECTOR INDEX thought_embedding_idx IF NOT EXISTS
+// [LOOKUP] embedding_synced sweep for the cross-store retry job
+// (DevNotes v1.3, Section 1.4).
+CREATE INDEX thought_embedding_synced_idx IF NOT EXISTS
   FOR (th:Thought)
-  ON (th.embedding)
-  OPTIONS {
-    indexConfig: {
-      `vector.dimensions`:   1536,
-      `vector.similarity_function`: 'cosine'
-    }
-  };
+  ON (th.embedding_synced);
 
 // [FULLTEXT] Thought content search -- supports keyword-level deduplication
 // before embedding similarity check.
@@ -377,18 +378,13 @@ CREATE INDEX memory_active_last_accessed_idx IF NOT EXISTS
   FOR (m:Memory)
   ON (m.active, m.last_accessed);
 
-// [VECTOR] Primary semantic retrieval index (hybrid retrieval signal 2).
-// pgvector cosine similarity -- top-5 Memory nodes closest to current
-// user message embedding.
-CREATE VECTOR INDEX memory_embedding_idx IF NOT EXISTS
+// [LOOKUP] embedding_synced sweep for the cross-store retry job
+// (DevNotes v1.3, Section 1.4). Memory is the primary semantic
+// retrieval target; the actual ANN query runs in pgvector against
+// memory_embeddings keyed by neo4j_node_id.
+CREATE INDEX memory_embedding_synced_idx IF NOT EXISTS
   FOR (m:Memory)
-  ON (m.embedding)
-  OPTIONS {
-    indexConfig: {
-      `vector.dimensions`:   1536,
-      `vector.similarity_function`: 'cosine'
-    }
-  };
+  ON (m.embedding_synced);
 
 // [FULLTEXT] Keyword fallback when cosine similarity is inconclusive.
 // Also used in therapist profile builder to surface key memory summaries.
