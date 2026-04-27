@@ -98,6 +98,13 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable, Iterable
 
+from agentic.agent.tools.context_awareness_tool import (
+    calculate_math,
+    current_context,
+    resolve_relative_time,
+    web_search,
+)
+
 # LangChain provider clients. Each is optional: we degrade gracefully when a
 # provider is not installed so the bot still runs against whichever key the
 # developer happens to have in their environment.
@@ -117,6 +124,7 @@ except Exception:  # pragma: no cover -- groq not installed
     Groq = None  # type: ignore[assignment]
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
+from langchain_core.messages import ToolMessage
 
 # ── Memory layer: one import per modular package ──────────────────────────
 from agentic.memory import neo4j_client as nc
@@ -185,6 +193,110 @@ logger = logging.getLogger("test_bot")
 
 
 # ---------------------------------------------------------------------------
+# Tools (context awareness)
+# ---------------------------------------------------------------------------
+
+BOT_TOOLS = [
+    current_context,
+    resolve_relative_time,
+    calculate_math,
+    web_search,
+]
+_TOOLS_BY_NAME = {t.name: t for t in BOT_TOOLS}
+
+
+def _bind_tools_if_supported(llm: Any) -> Any:
+    """Best-effort bind tools for models that support tool calling."""
+    binder = getattr(llm, "bind_tools", None)
+    if callable(binder):
+        try:
+            return binder(BOT_TOOLS)
+        except Exception as exc:
+            logger.warning("bind_tools failed (%s); continuing without tool-calling", exc)
+    return llm
+
+
+def _get_tool_calls(msg: Any) -> list[dict[str, Any]]:
+    """Extract tool calls from an AIMessage across providers."""
+    calls = getattr(msg, "tool_calls", None)
+    if isinstance(calls, list):
+        return [c for c in calls if isinstance(c, dict)]
+
+    kw = getattr(msg, "additional_kwargs", None)
+    if isinstance(kw, dict) and isinstance(kw.get("tool_calls"), list):
+        return [c for c in kw["tool_calls"] if isinstance(c, dict)]
+
+    return []
+
+
+async def _ainvoke_with_tools(llm: Any, messages: list[Any], *, max_hops: int = 6) -> AIMessage:
+    """Run an LLM turn with optional tool-calling hops.
+
+    For tool-capable models (OpenAI/Anthropic via LangChain), this will:
+      1) call the model
+      2) if it requests tools, run them and feed ToolMessage results
+      3) repeat until it returns a normal assistant response
+
+    If tool calling isn't supported, it degrades to a single model call.
+    """
+    working: list[Any] = list(messages)
+    web_urls: list[str] = []
+    web_seen: set[str] = set()
+    last: Any = None
+    for _ in range(max_hops):
+        last = await llm.ainvoke(working)
+        tool_calls = _get_tool_calls(last)
+        if not tool_calls:
+            break
+
+        working.append(last)
+        for call in tool_calls:
+            name = call.get("name")
+            args = call.get("args")
+            call_id = call.get("id")
+            tool = _TOOLS_BY_NAME.get(name)
+
+            if tool is None:
+                result: dict[str, Any] = {"error": f"unknown tool: {name}"}
+            else:
+                try:
+                    payload = args if isinstance(args, dict) else {}
+                    result = tool.invoke(payload)
+                except Exception as exc:
+                    result = {"error": f"tool failed: {exc}"}
+
+            # If web_search was used, capture reference URLs for the final reply.
+            if name == "web_search" and isinstance(result, dict):
+                rows = result.get("results")
+                if isinstance(rows, list):
+                    for row in rows:
+                        if not isinstance(row, dict):
+                            continue
+                        url = row.get("url")
+                        if isinstance(url, str):
+                            url = url.strip()
+                        if url and url not in web_seen:
+                            web_seen.add(url)
+                            web_urls.append(url)
+
+            content = json.dumps(result, ensure_ascii=False, default=str)
+            if call_id:
+                working.append(ToolMessage(content=content, tool_call_id=call_id))
+            else:
+                working.append(ToolMessage(content=content, tool_call_id="tool_call"))
+
+    if isinstance(last, AIMessage):
+        last.additional_kwargs = dict(getattr(last, "additional_kwargs", {}) or {})
+        last.additional_kwargs["web_search_urls"] = web_urls
+        return last
+    # Fallback: wrap unknown return types.
+    msg = AIMessage(content=str(getattr(last, "content", last)))
+    msg.additional_kwargs = dict(getattr(msg, "additional_kwargs", {}) or {})
+    msg.additional_kwargs["web_search_urls"] = web_urls
+    return msg
+
+
+# ---------------------------------------------------------------------------
 # Prompt
 # ---------------------------------------------------------------------------
 
@@ -192,6 +304,12 @@ SYSTEM_PROMPT = """You are a warm, evidence-based mental health companion.
 You are running inside a TEST HARNESS that exercises the long-term memory
 graph. After your normal reply, you MUST append a fenced JSON block tagged
 ``kg`` describing what the conversation revealed for the knowledge graph.
+
+You may use tools when needed to answer accurately:
+- current_context (current date/time/timezone)
+- resolve_relative_time (e.g. "tomorrow 5pm")
+- calculate_math (safe arithmetic)
+- web_search (OpenAI)
 
 Reply format:
 
@@ -378,7 +496,7 @@ class TurnOutput:
 def parse_turn(raw: str) -> TurnOutput:
     """
     Pull the user-facing reply out of ``<reply>...</reply>`` and the structured
-    block out of ``\`\`\`kg ... \`\`\```. Both are optional. If parsing fails we
+    block out of ```kg ... ```. Both are optional. If parsing fails we
     still return the raw text so the user sees something.
     """
     reply_match = _REPLY_RE.search(raw)
@@ -761,6 +879,10 @@ HELP_TEXT = """
 Slash commands:
   /help                              this message
   /context                           context block built for the next turn
+    /ctx                               print current datetime/timezone context
+    /calc <expression>                 calculate basic math (safe)
+    /time [--tz <Zone>] <text>         resolve relative time (e.g. "tomorrow 5pm")
+        /search [--n <k>] <query>          web search via OpenAI
   /flush                             run the idle-flush worker once
   /decay                             run the memory decay job once
   /sweep                             reconcile pgvector rows out of sync
@@ -776,6 +898,37 @@ Slash commands:
   /supersede <thought_id> <content>  kg_algorithm.supersede_thought(...)
   /end [summary]                     write a Memory summary and exit
 """.strip()
+
+
+def _append_references(reply: str, urls: list[str]) -> str:
+    if not urls:
+        return reply
+    out = reply.rstrip()
+    out += "\n\nReferensi:\n"
+    for url in urls:
+        out += f"- {url}\n"
+    return out.rstrip()
+
+
+def _format_search(result: dict[str, Any]) -> str:
+    if not result:
+        return "  (no result)"
+    if err := result.get("error"):
+        return f"  error: {err}"
+    rows = result.get("results")
+    if not rows:
+        return "  (no results)"
+    out: list[str] = []
+    for i, item in enumerate(rows, 1):
+        if not isinstance(item, dict):
+            continue
+        title = (item.get("title") or "").strip() or "(untitled)"
+        url = (item.get("url") or "").strip()
+        if url:
+            out.append(f"  {i}. {title}\n      {url}")
+        else:
+            out.append(f"  {i}. {title}")
+    return "\n".join(out)
 
 
 # ── Helpers used by the commands below ────────────────────────────────────
@@ -1045,6 +1198,67 @@ async def dispatch_command(line: str, ctx: BotContext) -> bool:
         print(c.as_prompt_block())
         return False
 
+    if cmd == "/ctx":
+        try:
+            print(json.dumps(current_context.invoke({}), ensure_ascii=False, indent=2, default=str))
+        except Exception as exc:
+            print(f"  tool failed: {exc}")
+        return False
+
+    if cmd == "/calc":
+        if not args:
+            print("  usage: /calc <expression>")
+            return False
+        expr = " ".join(args)
+        try:
+            print(json.dumps(calculate_math.invoke({"expression": expr}), ensure_ascii=False, indent=2, default=str))
+        except Exception as exc:
+            print(f"  tool failed: {exc}")
+        return False
+
+    if cmd == "/time":
+        if not args:
+            print("  usage: /time [--tz <Zone>] <text>")
+            return False
+        timezone_arg: str | None = None
+        text_parts = args
+        if len(args) >= 2 and args[0] == "--tz":
+            timezone_arg = args[1]
+            text_parts = args[2:]
+        text = " ".join(text_parts).strip()
+        if not text:
+            print("  usage: /time [--tz <Zone>] <text>")
+            return False
+        payload: dict[str, Any] = {"text": text}
+        if timezone_arg:
+            payload["timezone"] = timezone_arg
+        try:
+            print(json.dumps(resolve_relative_time.invoke(payload), ensure_ascii=False, indent=2, default=str))
+        except Exception as exc:
+            print(f"  tool failed: {exc}")
+        return False
+
+    if cmd == "/search":
+        if not args:
+            print("  usage: /search [--n <k>] <query>")
+            return False
+        n = 5
+        query_parts = args
+        if len(args) >= 2 and args[0] == "--n":
+            if args[1].isdigit():
+                n = int(args[1])
+            query_parts = args[2:]
+        query = " ".join(query_parts).strip()
+        if not query:
+            print("  usage: /search [--n <k>] <query>")
+            return False
+        try:
+            result = web_search.invoke({"query": query, "max_results": n})
+            print(_format_search(result if isinstance(result, dict) else {"results": result}))
+        except Exception as exc:
+            print(f"  tool failed: {exc}")
+        return False
+
     if cmd == "/snapshot":
         print(await cmd_snapshot(ctx.user_id))
         return False
@@ -1193,7 +1407,7 @@ async def dispatch_command(line: str, ctx: BotContext) -> bool:
 # ---------------------------------------------------------------------------
 
 async def chat_loop(user_id: str, session_id: str) -> None:
-    llm = _make_llm()
+    llm = _bind_tools_if_supported(_make_llm())
     history: list[Any] = []
     log = TurnLog()
     ctx = BotContext(
@@ -1260,7 +1474,7 @@ async def chat_loop(user_id: str, session_id: str) -> None:
         )
 
         try:
-            ai = await llm.ainvoke([sys_msg] + history)
+            ai = await _ainvoke_with_tools(llm, [sys_msg] + history)
         except Exception as exc:
             logger.exception("LLM call failed: %s", exc)
             print(f"[bot error: {exc}]")
@@ -1269,8 +1483,15 @@ async def chat_loop(user_id: str, session_id: str) -> None:
         parsed = parse_turn(ai.content if isinstance(ai.content, str) else str(ai.content))
         history.append(AIMessage(content=parsed.reply))
 
+        web_urls = []
+        kw = getattr(ai, "additional_kwargs", None)
+        if isinstance(kw, dict) and isinstance(kw.get("web_search_urls"), list):
+            web_urls = [u for u in kw["web_search_urls"] if isinstance(u, str) and u.strip()]
+
+        reply_for_user = _append_references(parsed.reply, web_urls)
+
         print("=" * 100)
-        print(f"bot> {parsed.reply}")
+        print(f"bot> {reply_for_user}")
         print("=" * 100)
 
         node_ids: dict[str, str | None] = {}
